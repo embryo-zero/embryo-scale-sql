@@ -1,0 +1,26 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "planner",
+    srcs = ["plan.go"],
+    importpath = "github.com/pingcap/tidb/pkg/dxf/framework/planner",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/dxf/framework/proto",
+        "//pkg/kv",
+        "//pkg/sessionctx",
+    ],
+)
+
+go_test(
+    name = "planner_test",
+    timeout = "short",
+    srcs = ["plan_test.go"],
+    flaky = True,
+    deps = [
+        ":planner",
+        "//pkg/dxf/framework/mock",
+        "@com_github_stretchr_testify//require",
+        "@org_uber_go_mock//gomock",
+    ],
+)

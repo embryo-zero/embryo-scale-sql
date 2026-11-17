@@ -1,0 +1,655 @@
+// Copyright 2025 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package issyncer
+
+import (
+	"context"
+	"errors"
+	"slices"
+	"testing"
+
+	"github.com/pingcap/tidb/pkg/config/kerneltype"
+	"github.com/pingcap/tidb/pkg/infoschema"
+	tidbkv "github.com/pingcap/tidb/pkg/kv"
+	"github.com/pingcap/tidb/pkg/meta"
+	"github.com/pingcap/tidb/pkg/meta/metadef"
+	"github.com/pingcap/tidb/pkg/meta/model"
+	"github.com/pingcap/tidb/pkg/parser/ast"
+	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/pingcap/tidb/pkg/store/mockstore"
+	"github.com/stretchr/testify/require"
+)
+
+// testNameFilter is a lightweight Filter implementation for tests, mimicking
+// BR behaviour without importing BR packages to avoid cycles.
+type testNameFilter struct {
+	allow func(ast.CIStr) bool
+}
+
+func newTestNameFilter(fn func(ast.CIStr) bool) Filter {
+	if fn == nil {
+		return nil
+	}
+	return &testNameFilter{allow: fn}
+}
+
+func (f *testNameFilter) SkipLoadDiff(diff *model.SchemaDiff, latestIS infoschema.InfoSchema) bool {
+	if f == nil || f.allow == nil {
+		return false
+	}
+	if diff.Type == model.ActionCreateSchema || diff.Type == model.ActionCreatePlacementPolicy {
+		return false
+	}
+	if diff.SchemaID == 0 {
+		return false
+	}
+	if latestIS == nil {
+		return true
+	}
+	schema, ok := latestIS.SchemaByID(diff.SchemaID)
+	selected := ok && f.allow(schema.Name)
+	return !selected
+}
+
+func (f *testNameFilter) SkipLoadSchema(dbInfo *model.DBInfo) bool {
+	if f == nil || f.allow == nil || dbInfo == nil {
+		return false
+	}
+	return !f.allow(dbInfo.Name)
+}
+
+func TestLoadFromTS(t *testing.T) {
+	store, err := mockstore.NewMockStore()
+	require.NoError(t, err)
+	l := newLoader(store, infoschema.NewCache(nil, 1), nil, nil)
+	ver, err := store.CurrentVersion(tidbkv.GlobalTxnScope)
+	require.NoError(t, err)
+	is, hitCache, oldSchemaVersion, changes, err := l.LoadWithTS(ver.Ver, false)
+	require.NoError(t, err)
+	allSchemas := is.AllSchemas()
+	// only 2 memory schemas are there
+	require.Len(t, allSchemas, 2)
+	require.True(t, slices.ContainsFunc(allSchemas, func(s *model.DBInfo) bool { return s.Name.L == "information_schema" }))
+	require.True(t, slices.ContainsFunc(allSchemas, func(s *model.DBInfo) bool { return s.Name.L == "metrics_schema" }))
+	require.False(t, hitCache)
+	require.Zero(t, oldSchemaVersion)
+	require.Nil(t, changes)
+
+	// hit cache
+	_, hitCache, _, changes, err = l.LoadWithTS(ver.Ver, false)
+	require.NoError(t, err)
+	require.True(t, hitCache)
+	require.Nil(t, changes)
+
+	ctx := tidbkv.WithInternalSourceType(context.Background(), tidbkv.InternalTxnAdmin)
+	require.NoError(t, tidbkv.RunInNewTxn(ctx, l.store, true, func(_ context.Context, txn tidbkv.Transaction) error {
+		mu := meta.NewMutator(txn)
+		require.NoError(t, mu.CreateDatabase(&model.DBInfo{ID: 1, Name: ast.NewCIStr("test")}))
+		require.NoError(t, mu.CreateTableOrView(1, &model.TableInfo{ID: 1, Name: ast.NewCIStr("t"), State: model.StatePublic}))
+		schVer, err := mu.GenSchemaVersion()
+		require.NoError(t, err)
+		require.NoError(t, mu.SetSchemaDiff(&model.SchemaDiff{
+			Version:  schVer,
+			Type:     model.ActionCreateTable,
+			SchemaID: 1,
+			TableID:  1,
+		}))
+		return nil
+	}))
+	ver, err = store.CurrentVersion(tidbkv.GlobalTxnScope)
+	require.NoError(t, err)
+	l = newLoader(store, infoschema.NewCache(nil, 1), nil, nil)
+	is, hitCache, oldSchemaVersion, changes, err = l.LoadWithTS(ver.Ver, false)
+	require.NoError(t, err)
+	allSchemas = is.AllSchemas()
+	require.EqualValues(t, 1, is.SchemaMetaVersion())
+	require.Len(t, allSchemas, 3)
+	require.True(t, slices.ContainsFunc(allSchemas, func(s *model.DBInfo) bool { return s.Name.L == "information_schema" }))
+	require.True(t, slices.ContainsFunc(allSchemas, func(s *model.DBInfo) bool { return s.Name.L == "metrics_schema" }))
+	require.True(t, slices.ContainsFunc(allSchemas, func(s *model.DBInfo) bool { return s.Name.L == "test" }))
+	require.False(t, hitCache)
+	require.Zero(t, oldSchemaVersion)
+	require.Nil(t, changes)
+	tbls, err := is.SchemaTableInfos(ctx, ast.NewCIStr("test"))
+	require.NoError(t, err)
+	require.Len(t, tbls, 1)
+	require.Equal(t, "t", tbls[0].Name.L)
+
+	// load from diff
+	require.NoError(t, tidbkv.RunInNewTxn(ctx, l.store, true, func(_ context.Context, txn tidbkv.Transaction) error {
+		mu := meta.NewMutator(txn)
+		require.NoError(t, mu.CreateTableOrView(1, &model.TableInfo{ID: 2, Name: ast.NewCIStr("t1"), State: model.StatePublic}))
+		schVer, err := mu.GenSchemaVersion()
+		require.NoError(t, err)
+		require.NoError(t, mu.SetSchemaDiff(&model.SchemaDiff{
+			Version:  schVer,
+			Type:     model.ActionCreateTable,
+			SchemaID: 1,
+			TableID:  2,
+		}))
+		return nil
+	}))
+	ver, err = store.CurrentVersion(tidbkv.GlobalTxnScope)
+	require.NoError(t, err)
+	is, hitCache, oldSchemaVersion, changes, err = l.LoadWithTS(ver.Ver, false)
+	require.NoError(t, err)
+	allSchemas = is.AllSchemas()
+	require.EqualValues(t, 2, is.SchemaMetaVersion())
+	require.Len(t, allSchemas, 3)
+	require.True(t, slices.ContainsFunc(allSchemas, func(s *model.DBInfo) bool { return s.Name.L == "information_schema" }))
+	require.True(t, slices.ContainsFunc(allSchemas, func(s *model.DBInfo) bool { return s.Name.L == "metrics_schema" }))
+	require.True(t, slices.ContainsFunc(allSchemas, func(s *model.DBInfo) bool { return s.Name.L == "test" }))
+	require.False(t, hitCache)
+	require.EqualValues(t, 1, oldSchemaVersion)
+	require.Len(t, changes.PhyTblIDS, 1)
+	tbls, err = is.SchemaTableInfos(ctx, ast.NewCIStr("test"))
+	require.NoError(t, err)
+	require.Len(t, tbls, 2)
+	require.True(t, slices.ContainsFunc(tbls, func(t *model.TableInfo) bool { return t.Name.L == "t" }))
+	require.True(t, slices.ContainsFunc(tbls, func(t *model.TableInfo) bool { return t.Name.L == "t1" }))
+}
+
+func TestLoadFromTSForCrossKS(t *testing.T) {
+	if kerneltype.IsClassic() {
+		t.Skip("cross-keyspace schema loading requires NextGen")
+	}
+	for _, tc := range []struct {
+		name    string
+		dbID    int64
+		tableID int64
+	}{
+		{name: "nextgen", dbID: metadef.SystemDatabaseID, tableID: metadef.TiDBDDLReorgTableID},
+		{name: "classic", dbID: 1, tableID: 100},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := mockstore.NewMockStore()
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, store.Close()) })
+			l := NewLoaderForCrossKS(store, infoschema.NewCache(nil, 1))
+
+			ctx := tidbkv.WithInternalSourceType(context.Background(), tidbkv.InternalTxnAdmin)
+			systemDBID := tc.dbID
+			require.NoError(t, tidbkv.RunInNewTxn(ctx, l.store, true, func(_ context.Context, txn tidbkv.Transaction) error {
+				mu := meta.NewMutator(txn)
+				require.NoError(t, mu.CreateDatabase(&model.DBInfo{ID: systemDBID, Name: ast.NewCIStr(mysql.SystemDB)}))
+				testTblID := tc.tableID
+				require.NoError(t, mu.CreateTableOrView(systemDBID, &model.TableInfo{ID: testTblID, Name: ast.NewCIStr("user"), State: model.StatePublic}))
+				schVer, err := mu.GenSchemaVersion()
+				require.NoError(t, err)
+				require.NoError(t, mu.SetSchemaDiff(&model.SchemaDiff{
+					Version:  schVer,
+					Type:     model.ActionCreateTable,
+					SchemaID: systemDBID,
+					TableID:  testTblID,
+				}))
+				return nil
+			}))
+			ver, err := store.CurrentVersion(tidbkv.GlobalTxnScope)
+			require.NoError(t, err)
+			is, hitCache, oldSchemaVersion, changes, err := l.LoadWithTS(ver.Ver, false)
+			require.NoError(t, err)
+			allSchemas := is.AllSchemas()
+			require.NotNil(t, l.legacyNextGen.Load())
+			require.Equal(t, tc.name == "classic", l.isLegacyNextGen())
+			require.EqualValues(t, 1, is.SchemaMetaVersion())
+			require.Len(t, allSchemas, 1)
+			require.Equal(t, mysql.SystemDB, allSchemas[0].Name.L)
+			require.Equal(t, systemDBID, allSchemas[0].ID)
+			require.False(t, hitCache)
+			require.Zero(t, oldSchemaVersion)
+			require.Nil(t, changes)
+			tbls, err := is.SchemaTableInfos(ctx, ast.NewCIStr(mysql.SystemDB))
+			require.NoError(t, err)
+			require.Len(t, tbls, 1)
+			require.Equal(t, "user", tbls[0].Name.L)
+
+			// Load new built-in mysql tables, including those with legacy IDs.
+			require.NoError(t, tidbkv.RunInNewTxn(ctx, l.store, true, func(_ context.Context, txn tidbkv.Transaction) error {
+				mu := meta.NewMutator(txn)
+				testTblID := tc.tableID + 1
+				require.NoError(t, mu.CreateTableOrView(systemDBID, &model.TableInfo{ID: testTblID, Name: ast.NewCIStr("global_priv"), State: model.StatePublic}))
+				schVer, err := mu.GenSchemaVersion()
+				require.NoError(t, err)
+				require.NoError(t, mu.SetSchemaDiff(&model.SchemaDiff{
+					Version:  schVer,
+					Type:     model.ActionCreateTable,
+					SchemaID: systemDBID,
+					TableID:  testTblID,
+				}))
+
+				// Both diffs must be recognized while the cached schema still
+				// lacks this table, including the ALTER after its CREATE.
+				tbl, err := mu.GetTable(systemDBID, testTblID)
+				require.NoError(t, err)
+				tbl.Comment = "updated after creation"
+				require.NoError(t, mu.UpdateTable(systemDBID, tbl))
+				schVer, err = mu.GenSchemaVersion()
+				require.NoError(t, err)
+				require.NoError(t, mu.SetSchemaDiff(&model.SchemaDiff{
+					Version:  schVer,
+					Type:     model.ActionModifyTableComment,
+					SchemaID: systemDBID,
+					TableID:  testTblID,
+				}))
+
+				require.NoError(t, mu.CreateTableOrView(systemDBID, &model.TableInfo{ID: 200, Name: ast.NewCIStr("t200"), State: model.StatePublic}))
+				schVer, err = mu.GenSchemaVersion()
+				require.NoError(t, err)
+				require.NoError(t, mu.SetSchemaDiff(&model.SchemaDiff{
+					Version:  schVer,
+					Type:     model.ActionCreateTable,
+					SchemaID: systemDBID,
+					TableID:  200,
+				}))
+				require.NoError(t, mu.CreateDatabase(&model.DBInfo{ID: 8000, Name: ast.NewCIStr("userdb")}))
+				require.NoError(t, mu.CreateTableOrView(8000, &model.TableInfo{ID: 8001, Name: ast.NewCIStr("user_table"), State: model.StatePublic}))
+				schVer, err = mu.GenSchemaVersion()
+				require.NoError(t, err)
+				require.NoError(t, mu.SetSchemaDiff(&model.SchemaDiff{Version: schVer, Type: model.ActionCreateTable, SchemaID: 8000, TableID: 8001}))
+				return nil
+			}))
+			ver, err = store.CurrentVersion(tidbkv.GlobalTxnScope)
+			require.NoError(t, err)
+			// The owner can observe the new table before the assumed server.
+			ownerLoader := newLoader(store, infoschema.NewCache(nil, 1), nil, nil)
+			ownerIS, _, _, _, err := ownerLoader.LoadWithTS(ver.Ver, false)
+			require.NoError(t, err)
+			require.True(t, infoschema.IsSystemTableInNextGen(ownerIS, tc.name == "classic", tc.tableID+1))
+			_, cached := l.infoCache.GetLatest().TableItemByID(tc.tableID + 1)
+			require.False(t, cached)
+			is, hitCache, oldSchemaVersion, changes, err = l.LoadWithTS(ver.Ver, false)
+			require.NoError(t, err)
+			allSchemas = is.AllSchemas()
+			require.EqualValues(t, 5, is.SchemaMetaVersion())
+			require.Len(t, allSchemas, 1)
+			require.Equal(t, mysql.SystemDB, allSchemas[0].Name.L)
+			require.Equal(t, systemDBID, allSchemas[0].ID)
+			require.False(t, hitCache)
+			require.EqualValues(t, 1, oldSchemaVersion)
+			require.NotNil(t, changes)
+			require.Equal(t, []int64{tc.tableID + 1, tc.tableID + 1}, changes.PhyTblIDS)
+			tbls, err = is.SchemaTableInfos(ctx, ast.NewCIStr(mysql.SystemDB))
+			require.NoError(t, err)
+			require.Len(t, tbls, 2)
+			require.True(t, slices.ContainsFunc(tbls, func(t *model.TableInfo) bool { return t.Name.L == "user" }))
+			require.True(t, slices.ContainsFunc(tbls, func(t *model.TableInfo) bool { return t.Name.L == "global_priv" }))
+			created, err := is.TableByName(ctx, ast.NewCIStr(mysql.SystemDB), ast.NewCIStr("global_priv"))
+			require.NoError(t, err)
+			require.Equal(t, "updated after creation", created.Meta().Comment)
+			syncer := &Syncer{crossKS: true, loader: l}
+			require.False(t, syncer.skipMDLCheck(map[int64]struct{}{created.Meta().ID: {}}, is),
+				"the assumed server must acknowledge MDL for the new built-in")
+			require.True(t, syncer.skipMDLCheck(map[int64]struct{}{200: {}}, is),
+				"custom mysql tables must remain ordinary user tables")
+		})
+	}
+}
+
+type testStoreWithKS struct {
+	tidbkv.Storage
+}
+
+func (testStoreWithKS) GetKeyspace() string {
+	return "test_ks"
+}
+
+func mustSkipLoadingDiff(t *testing.T, loader *Loader, diff *model.SchemaDiff) bool {
+	t.Helper()
+	skip, err := loader.skipLoadingDiff(nil, diff)
+	require.NoError(t, err)
+	return skip
+}
+
+func TestLoaderSkipLoadingDiff(t *testing.T) {
+	syncer := New(nil, nil, 0, nil, nil, nil)
+	require.False(t, mustSkipLoadingDiff(t, syncer.loader, &model.SchemaDiff{}))
+	require.False(t, mustSkipLoadingDiff(t, syncer.loader, &model.SchemaDiff{TableID: 100}))
+	require.False(t, mustSkipLoadingDiff(t, syncer.loader, &model.SchemaDiff{OldTableID: 100}))
+	require.False(t, mustSkipLoadingDiff(t, syncer.loader, &model.SchemaDiff{TableID: 100, OldTableID: 100}))
+	require.False(t, mustSkipLoadingDiff(t, syncer.loader, &model.SchemaDiff{TableID: metadef.ReservedGlobalIDUpperBound}))
+	require.False(t, mustSkipLoadingDiff(t, syncer.loader, &model.SchemaDiff{OldTableID: metadef.ReservedGlobalIDUpperBound}))
+	require.False(t, mustSkipLoadingDiff(t, syncer.loader, &model.SchemaDiff{TableID: metadef.ReservedGlobalIDUpperBound,
+		OldTableID: metadef.ReservedGlobalIDUpperBound}))
+
+	cache := infoschema.NewCache(nil, 1)
+	cache.Insert(infoschema.MockInfoSchema(nil), 0)
+	loaderForCrossKS := NewLoaderForCrossKS(testStoreWithKS{}, cache)
+	for _, isLegacyNextGen := range []bool{false, true} {
+		loaderForCrossKS.legacyNextGen.Store(&isLegacyNextGen)
+		for _, tc := range []struct {
+			id                     int64
+			skipNative, skipLegacy bool
+		}{
+			{0, true, true},
+			{123, true, true},
+			{9999, true, false},
+			{10000, true, true},
+			{metadef.GlobalPrivTableID, false, true},
+		} {
+			id, wantSkip := tc.id, tc.skipNative
+			if isLegacyNextGen {
+				wantSkip = tc.skipLegacy
+			}
+			if kerneltype.IsClassic() {
+				wantSkip = true
+			}
+			for _, diff := range []*model.SchemaDiff{
+				{TableID: id}, {OldTableID: id}, {TableID: id, OldTableID: id},
+			} {
+				require.Equal(t, wantSkip, mustSkipLoadingDiff(t, loaderForCrossKS, diff), "isLegacyNextGen=%t id=%d", isLegacyNextGen, id)
+			}
+		}
+		// AffectedOpts alone must not make a diff relevant to system tables.
+		for _, affected := range []*model.AffectedOption{
+			{SchemaID: 2, TableID: 9999},
+			{OldSchemaID: 2, OldTableID: metadef.GlobalPrivTableID},
+		} {
+			require.True(t, mustSkipLoadingDiff(t, loaderForCrossKS, &model.SchemaDiff{
+				TableID: 100, OldTableID: 100, AffectedOpts: []*model.AffectedOption{affected},
+			}))
+		}
+	}
+}
+
+type tableLookupReader struct {
+	meta.Reader
+	getTable func(int64, int64) (*model.TableInfo, error)
+}
+
+func (r tableLookupReader) GetTable(dbID, tableID int64) (*model.TableInfo, error) {
+	return r.getTable(dbID, tableID)
+}
+
+func TestLoaderSkipLoadingDiffMetadata(t *testing.T) {
+	if kerneltype.IsClassic() {
+		t.Skip("snapshot classification of legacy system tables requires NextGen")
+	}
+	db := &model.DBInfo{ID: 2, Name: ast.NewCIStr(mysql.SystemDB), State: model.StatePublic}
+	db.Deprecated.Tables = []*model.TableInfo{
+		{ID: 9999, DBID: db.ID, Name: ast.NewCIStr("stats_meta"), State: model.StatePublic},
+		{ID: 10000, DBID: db.ID, Name: ast.NewCIStr("custom_table"), State: model.StatePublic},
+	}
+	builder := infoschema.NewBuilder(nil, 0, nil, infoschema.NewData(), false)
+	require.NoError(t, builder.InitWithDBInfos([]*model.DBInfo{
+		db, {ID: 1, Name: ast.NewCIStr("test"), State: model.StatePublic},
+	}, nil, nil, nil, 1))
+	cache := infoschema.NewCache(nil, 1)
+	cache.Insert(builder.Build(0), 0)
+	lookupErr := errors.New("table metadata read failed")
+	for _, tt := range []struct {
+		name                   string
+		diff                   model.SchemaDiff
+		tableName              string
+		err                    error
+		native, skip, wantRead bool
+	}{
+		{name: "new built-in", diff: model.SchemaDiff{SchemaID: 2, TableID: 101}, tableName: "global_priv", wantRead: true},
+		{name: "custom mysql table", diff: model.SchemaDiff{SchemaID: 2, TableID: 101}, tableName: "custom_new", skip: true, wantRead: true},
+		{name: "missing table", diff: model.SchemaDiff{SchemaID: 2, TableID: 101}, skip: true, wantRead: true},
+		{name: "lookup error", diff: model.SchemaDiff{SchemaID: 2, TableID: 101}, err: lookupErr, wantRead: true},
+		{name: "cached built-in", diff: model.SchemaDiff{SchemaID: 2, TableID: 9999}},
+		{name: "cached custom table", diff: model.SchemaDiff{SchemaID: 2, TableID: 10000}, skip: true},
+		{name: "user database", diff: model.SchemaDiff{SchemaID: 1, TableID: 101}, skip: true},
+		{name: "unknown database", diff: model.SchemaDiff{SchemaID: 3, TableID: 101}, skip: true},
+		{name: "zero table ID", diff: model.SchemaDiff{SchemaID: 2}, skip: true},
+		{name: "old ID in same database", diff: model.SchemaDiff{SchemaID: 2, OldTableID: 101}, tableName: "global_priv", wantRead: true},
+		{name: "old database ID", diff: model.SchemaDiff{SchemaID: 1, OldSchemaID: 2, OldTableID: 101}, tableName: "global_priv", wantRead: true},
+		{name: "old user database", diff: model.SchemaDiff{SchemaID: 2, OldSchemaID: 1, OldTableID: 101}, skip: true},
+		{name: "native NextGen", diff: model.SchemaDiff{SchemaID: 2, TableID: 101}, native: true, skip: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			loader := NewLoaderForCrossKS(testStoreWithKS{}, cache)
+			legacy := !tt.native
+			loader.legacyNextGen.Store(&legacy)
+			reads := 0
+			m := tableLookupReader{getTable: func(dbID, tableID int64) (*model.TableInfo, error) {
+				reads++
+				require.EqualValues(t, 2, dbID)
+				require.EqualValues(t, 101, tableID)
+				if tt.err != nil || tt.tableName == "" {
+					return nil, tt.err
+				}
+				return &model.TableInfo{ID: tableID, Name: ast.NewCIStr(tt.tableName)}, nil
+			}}
+			skip, err := loader.skipLoadingDiff(m, &tt.diff)
+			if tt.err != nil {
+				require.ErrorIs(t, err, tt.err)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tt.skip, skip)
+			}
+			if tt.wantRead {
+				require.Equal(t, 1, reads)
+			} else {
+				require.Zero(t, reads)
+			}
+		})
+	}
+}
+
+func TestLoaderSkipLoadingDiffForBR(t *testing.T) {
+	store, err := mockstore.NewMockStore()
+	require.NoError(t, err)
+
+	ctx := tidbkv.WithInternalSourceType(context.Background(), tidbkv.InternalTxnAdmin)
+
+	// Create databases: system database, BR-related database, and user database
+	require.NoError(t, tidbkv.RunInNewTxn(ctx, store, true, func(_ context.Context, txn tidbkv.Transaction) error {
+		mu := meta.NewMutator(txn)
+		// Create mysql (system database) with ID 1
+		require.NoError(t, mu.CreateDatabase(&model.DBInfo{ID: 1, Name: ast.NewCIStr(mysql.SystemDB)}))
+		// Create BR-related database with ID 2
+		require.NoError(t, mu.CreateDatabase(&model.DBInfo{ID: 2, Name: ast.NewCIStr("__TiDB_BR_Temporary_test")}))
+		// Create user database with ID 3
+		require.NoError(t, mu.CreateDatabase(&model.DBInfo{ID: 3, Name: ast.NewCIStr("userdb")}))
+		return nil
+	}))
+
+	ver, err := store.CurrentVersion(tidbkv.GlobalTxnScope)
+	require.NoError(t, err)
+
+	// Create loader for BR with a filter function that only loads system and BR-related databases
+	brFilter := newTestNameFilter(func(dbName ast.CIStr) bool {
+		return metadef.IsSystemDB(dbName.L) || metadef.IsBRRelatedDB(dbName.O)
+	})
+	loaderForBR := newLoader(store, infoschema.NewCache(nil, 1), nil, brFilter)
+	require.NotNil(t, loaderForBR.filter)
+
+	// Load initial schema to populate the cache
+	_, _, _, _, err = loaderForBR.LoadWithTS(ver.Ver, false)
+	require.NoError(t, err)
+
+	// Test case 1: Schema diff for system database - should NOT skip
+	t.Run("system_db", func(t *testing.T) {
+		systemDiff := &model.SchemaDiff{
+			SchemaID: 1, // mysql system database
+			TableID:  10,
+		}
+		require.False(t, mustSkipLoadingDiff(t, loaderForBR, systemDiff), "should NOT skip diff for system database")
+	})
+
+	// Test case 1.1: CREATE DATABASE diff should always pass through the filter
+	t.Run("create_database_action", func(t *testing.T) {
+		createDBDiff := &model.SchemaDiff{
+			Type:     model.ActionCreateSchema,
+			SchemaID: 4,
+		}
+		require.False(t, mustSkipLoadingDiff(t, loaderForBR, createDBDiff), "should NOT skip CREATE DATABASE diffs even when the schema name is unknown")
+	})
+
+	// Test case 2: Schema diff for BR-related database - should NOT skip
+	t.Run("br_related_db", func(t *testing.T) {
+		brDiff := &model.SchemaDiff{
+			SchemaID: 2, // BR-related database
+			TableID:  20,
+		}
+		require.False(t, mustSkipLoadingDiff(t, loaderForBR, brDiff), "should NOT skip diff for BR-related database")
+	})
+
+	// Test case 3: Schema diff for user database - should skip
+	t.Run("user_db", func(t *testing.T) {
+		userDiff := &model.SchemaDiff{
+			SchemaID: 3, // user database
+			TableID:  30,
+		}
+		require.True(t, mustSkipLoadingDiff(t, loaderForBR, userDiff), "should skip diff for user database")
+	})
+
+	// Test case 4: Schema diff with OldSchemaID for system database - still skipped because selection is based on SchemaID
+	t.Run("old_system_to_user", func(t *testing.T) {
+		oldSystemDiff := &model.SchemaDiff{
+			OldSchemaID: 1, // mysql system database
+			SchemaID:    3, // user database
+			TableID:     40,
+		}
+		require.True(t, mustSkipLoadingDiff(t, loaderForBR, oldSystemDiff), "should skip diff when SchemaID is filtered out even if OldSchemaID is system database")
+	})
+
+	// Test case 5: Schema diff with OldSchemaID for BR-related database - still skipped because SchemaID is filtered out
+	t.Run("old_br_to_user", func(t *testing.T) {
+		oldBRDiff := &model.SchemaDiff{
+			OldSchemaID: 2, // BR-related database
+			SchemaID:    3, // user database
+			TableID:     50,
+		}
+		require.True(t, mustSkipLoadingDiff(t, loaderForBR, oldBRDiff), "should skip diff when SchemaID is filtered out even if OldSchemaID is BR-related database")
+	})
+
+	// Test case 6: Schema diff with both SchemaID and OldSchemaID as user databases - should skip
+	t.Run("user_to_user", func(t *testing.T) {
+		userToUserDiff := &model.SchemaDiff{
+			OldSchemaID: 3, // user database
+			SchemaID:    3, // user database
+			TableID:     60,
+		}
+		require.True(t, mustSkipLoadingDiff(t, loaderForBR, userToUserDiff), "should skip diff when both SchemaID and OldSchemaID are user databases")
+	})
+
+	// Test case 7: Schema diff with non-existent SchemaID - should skip
+	t.Run("non_existent_db", func(t *testing.T) {
+		nonExistentDiff := &model.SchemaDiff{
+			SchemaID: 999, // non-existent database
+			TableID:  70,
+		}
+		require.True(t, mustSkipLoadingDiff(t, loaderForBR, nonExistentDiff), "should skip diff for non-existent database")
+	})
+}
+
+func TestLoadForBR(t *testing.T) {
+	store, err := mockstore.NewMockStore()
+	require.NoError(t, err)
+
+	ctx := tidbkv.WithInternalSourceType(context.Background(), tidbkv.InternalTxnAdmin)
+
+	// Create multiple databases: system database, BR-related database, and user database
+	require.NoError(t, tidbkv.RunInNewTxn(ctx, store, true, func(_ context.Context, txn tidbkv.Transaction) error {
+		mu := meta.NewMutator(txn)
+		// Create mysql (system database)
+		require.NoError(t, mu.CreateDatabase(&model.DBInfo{ID: 1, Name: ast.NewCIStr(mysql.SystemDB)}))
+		require.NoError(t, mu.CreateTableOrView(1, &model.TableInfo{ID: 1, Name: ast.NewCIStr("t1"), State: model.StatePublic}))
+
+		// Create a BR-related temporary database
+		require.NoError(t, mu.CreateDatabase(&model.DBInfo{ID: 2, Name: ast.NewCIStr("__TiDB_BR_Temporary_test")}))
+		require.NoError(t, mu.CreateTableOrView(2, &model.TableInfo{ID: 2, Name: ast.NewCIStr("t2"), State: model.StatePublic}))
+
+		// Create a regular user database
+		require.NoError(t, mu.CreateDatabase(&model.DBInfo{ID: 3, Name: ast.NewCIStr("userdb")}))
+		require.NoError(t, mu.CreateTableOrView(3, &model.TableInfo{ID: 3, Name: ast.NewCIStr("t3"), State: model.StatePublic}))
+
+		schVer, err := mu.GenSchemaVersion()
+		require.NoError(t, err)
+		require.NoError(t, mu.SetSchemaDiff(&model.SchemaDiff{
+			Version:  schVer,
+			Type:     model.ActionCreateTable,
+			SchemaID: 3,
+			TableID:  3,
+		}))
+		return nil
+	}))
+
+	ver, err := store.CurrentVersion(tidbkv.GlobalTxnScope)
+	require.NoError(t, err)
+
+	// Test with BR filter (only load system and BR-related databases)
+	t.Run("br_filter_only", func(t *testing.T) {
+		brFilter := newTestNameFilter(func(dbName ast.CIStr) bool {
+			return metadef.IsSystemDB(dbName.L) || metadef.IsBRRelatedDB(dbName.O)
+		})
+		loaderForBR := newLoader(store, infoschema.NewCache(nil, 1), nil, brFilter)
+		is, hitCache, oldSchemaVersion, changes, err := loaderForBR.LoadWithTS(ver.Ver, false)
+		require.NoError(t, err)
+		require.False(t, hitCache)
+		require.Zero(t, oldSchemaVersion)
+		require.Nil(t, changes)
+
+		// Verify only system databases and BR-related databases are loaded
+		allSchemas := is.AllSchemas()
+		schemaNames := make(map[string]bool)
+		for _, schema := range allSchemas {
+			schemaNames[schema.Name.L] = true
+		}
+
+		// Should include system database
+		require.True(t, schemaNames[mysql.SystemDB], "system database should be loaded")
+		// Should include BR-related database
+		require.True(t, schemaNames["__tidb_br_temporary_test"], "BR-related database should be loaded")
+		// Should NOT include user database
+		require.False(t, schemaNames["userdb"], "user database should NOT be loaded for BR")
+		// Should include memory schemas
+		require.True(t, schemaNames["information_schema"], "information_schema should be loaded")
+		require.True(t, schemaNames["metrics_schema"], "metrics_schema should be loaded")
+
+		// Verify tables in system database
+		tbls, err := is.SchemaTableInfos(ctx, ast.NewCIStr(mysql.SystemDB))
+		require.NoError(t, err)
+		require.Len(t, tbls, 1)
+		require.Equal(t, "t1", tbls[0].Name.L)
+
+		// Verify tables in BR-related database
+		tbls, err = is.SchemaTableInfos(ctx, ast.NewCIStr("__TiDB_BR_Temporary_test"))
+		require.NoError(t, err)
+		require.Len(t, tbls, 1)
+		require.Equal(t, "t2", tbls[0].Name.L)
+
+		// Verify user database is not accessible
+		tbls, err = is.SchemaTableInfos(ctx, ast.NewCIStr("userdb"))
+		require.NoError(t, err)
+		require.Len(t, tbls, 0)
+	})
+
+	// Test with no filter (load all databases)
+	t.Run("no_filter_all_dbs", func(t *testing.T) {
+		loaderNormal := newLoader(store, infoschema.NewCache(nil, 1), nil, nil)
+		isNormal, hitCache, oldSchemaVersion, changes, err := loaderNormal.LoadWithTS(ver.Ver, false)
+		require.NoError(t, err)
+		require.False(t, hitCache)
+		require.Zero(t, oldSchemaVersion)
+		require.Nil(t, changes)
+
+		// Verify all databases are loaded when no filter is used
+		allSchemasNormal := isNormal.AllSchemas()
+		schemaNamesNormal := make(map[string]bool)
+		for _, schema := range allSchemasNormal {
+			schemaNamesNormal[schema.Name.L] = true
+		}
+
+		// Should include all databases
+		require.True(t, schemaNamesNormal[mysql.SystemDB], "system database should be loaded")
+		require.True(t, schemaNamesNormal["__tidb_br_temporary_test"], "BR-related database should be loaded")
+		require.True(t, schemaNamesNormal["userdb"], "user database should be loaded")
+		require.True(t, schemaNamesNormal["information_schema"], "information_schema should be loaded")
+		require.True(t, schemaNamesNormal["metrics_schema"], "metrics_schema should be loaded")
+	})
+}
